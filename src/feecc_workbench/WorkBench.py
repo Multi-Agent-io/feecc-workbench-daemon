@@ -258,7 +258,7 @@ class WorkBench(metaclass=SingletonMeta):
                     )
                     ipfs_hashes = []
 
-        await self.unit.end_operation(
+        self.unit.end_operation(
             video_hashes=ipfs_hashes,
             additional_info=additional_info,
             premature=premature,

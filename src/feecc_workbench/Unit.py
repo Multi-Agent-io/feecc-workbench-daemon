@@ -57,13 +57,10 @@ class Unit:
         self.is_in_db: bool = is_in_db or False
         self.creation_time: dt.datetime = creation_time or dt.datetime.now()
 
-        if self.components_units:
-            slots: dict[str, Unit | None] = {u.schema.schema_id: u for u in self.components_units}
-            assert all(
-                k in (self.schema.required_components_schema_ids or []) for k in slots
-            ), "Provided components are not a part of the unit schema"
-        else:
-            slots = {schema_id: None for schema_id in (schema.required_components_schema_ids or [])}
+        slots: dict[str, Unit | None] = {schema_id: None for schema_id in (schema.required_components_schema_ids or [])}
+        for component in self.components_units:
+            if component.schema.schema_id in slots:
+                slots[component.schema.schema_id] = component
 
         self._component_slots: dict[str, Unit | None] = slots
 
@@ -184,7 +181,7 @@ class Unit:
         for i in range(target_pos + 1, len(self.biography)):
             self.biography[i].number += 1
 
-    async def end_operation(
+    def end_operation(
         self,
         video_hashes: list[str] | None = None,
         additional_info: AdditionalInfo | None = None,
@@ -202,25 +199,20 @@ class Unit:
 
         logger.info(f"Ending production stage {operation.name} on unit {self.uuid}")
         operation.session_end_time = override_timestamp or timestamp()
+        operation.video_hashes = video_hashes
+        operation.completed = True
 
         if premature:
             self._duplicate_current_operation()
             operation.name += " (неокончен.)"
             operation.ended_prematurely = True
 
-        if video_hashes:
-            operation.video_hashes = video_hashes
-
         if additional_info:
-            if operation.additional_info is not None:
-                operation.additional_info = {
-                    **operation.additional_info,
-                    **additional_info,
-                }
-            else:
-                operation.additional_info = additional_info
+            operation.additional_info = {
+                **(operation.additional_info or {}),
+                **additional_info,
+            }
 
-        operation.completed = True
         self.biography[operation.number] = operation
 
         if all(stage.completed for stage in self.biography):
