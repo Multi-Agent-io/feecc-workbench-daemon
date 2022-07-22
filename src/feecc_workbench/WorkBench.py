@@ -1,10 +1,8 @@
 import asyncio
-import os
 from pathlib import Path
 
 from loguru import logger
 
-from ._image_generation import create_qr, create_seal_tag
 from ._short_url_generator import generate_short_url
 from .Camera import Camera
 from .config import CONFIG
@@ -15,7 +13,7 @@ from .ipfs import publish_file
 from .Messenger import messenger
 from .models import ProductionSchema
 from .passport_generator import construct_unit_passport
-from .printer import print_image
+from .printer import print_passport_qr_code, print_seal_tag, print_unit_barcode
 from .robonomics import post_to_datalog
 from .Singleton import SingletonMeta
 from .states import STATE_TRANSITION_MAP, State
@@ -23,6 +21,7 @@ from .Types import AdditionalInfo
 from .Unit import Unit
 from .unit_utils import UnitStatus
 from .utils import timestamp
+from .workbench_utils import determine_asssignment_target, generate_short_url_background
 
 STATE_SWITCH_EVENT = asyncio.Event()
 
@@ -48,32 +47,15 @@ class WorkBench(metaclass=SingletonMeta):
     @logger.catch(reraise=True, exclude=(StateForbiddenError, AssertionError))
     async def create_new_unit(self, schema: ProductionSchema) -> Unit:
         """initialize a new instance of the Unit class"""
+        assert self.employee is not None, "Cannot create unit unless employee is logged in"
         if self.state != State.AUTHORIZED_IDLING_STATE:
             message = "Cannot create a new unit unless workbench has state AuthorizedIdling"
             messenger.error("Для создания нового изделия рабочий стол должен иметь состояние AuthorizedIdling")
             raise StateForbiddenError(message)
-
         unit = Unit(schema)
-
         if CONFIG.printer.print_barcode and CONFIG.printer.enable:
-            if unit.schema.parent_schema_id is None:
-                annotation = unit.schema.unit_name
-            else:
-                parent_schema = await self._database.get_schema_by_id(unit.schema.parent_schema_id)
-                annotation = f"{parent_schema.unit_name}. {unit.model_name}."
-
-            assert self.employee is not None
-
-            try:
-                await print_image(Path(unit.barcode.filename), self.employee.rfid_card_id, annotation=annotation)
-            except Exception as e:
-                messenger.error(f"Ошибка при печати этикетки: {e}")
-                raise e
-            finally:
-                os.remove(unit.barcode.filename)
-
+            await print_unit_barcode(unit, self.employee.rfid_card_id)
         await self._database.push_unit(unit)
-
         return unit
 
     def _validate_state_transition(self, new_state: State) -> None:
@@ -95,70 +77,50 @@ class WorkBench(metaclass=SingletonMeta):
     def log_in(self, employee: Employee) -> None:
         """authorize employee"""
         self._validate_state_transition(State.AUTHORIZED_IDLING_STATE)
-
         self.employee = employee
         message = f"Employee {employee.name} is logged in at the workbench no. {self.number}"
         logger.info(message)
         messenger.success(f"Авторизован {employee.position} {employee.name}")
-
         self.switch_state(State.AUTHORIZED_IDLING_STATE)
 
     @logger.catch(reraise=True, exclude=(StateForbiddenError, AssertionError))
     def log_out(self) -> None:
         """log out the employee"""
         self._validate_state_transition(State.AWAIT_LOGIN_STATE)
-
         if self.state == State.UNIT_ASSIGNED_IDLING_STATE:
             self.remove_unit()
-
         assert self.employee is not None
-        message = f"Employee {self.employee.name} was logged out at the workbench no. {self.number}"
-        logger.info(message)
+        logger.info(f"Employee {self.employee.name} was logged out at the workbench no. {self.number}")
         messenger.success(f"{self.employee.name} вышел из системы")
         self.employee = None
-
         self.switch_state(State.AWAIT_LOGIN_STATE)
 
     @logger.catch(reraise=True, exclude=(StateForbiddenError, AssertionError))
     def assign_unit(self, unit: Unit) -> None:
         """assign a unit to the workbench"""
         self._validate_state_transition(State.UNIT_ASSIGNED_IDLING_STATE)
+        allowed_statuses = (UnitStatus.production, UnitStatus.revision)
+        unit, allowed = determine_asssignment_target(unit, allowed_statuses)
 
-        def _get_unit_list(unit_: Unit) -> list[Unit]:
-            """list all the units in the component tree"""
-            units_tree = [unit_]
-            for component_ in unit_.components_units:
-                nested = _get_unit_list(component_)
-                units_tree.extend(nested)
-            return units_tree
-
-        allowed = (UnitStatus.production, UnitStatus.revision)
-        override = unit.status == UnitStatus.built and unit.passport_ipfs_cid is None
-
-        if unit.status not in allowed:
-            for component in _get_unit_list(unit):
-                if component.status in allowed:
-                    unit = component
-                    break
-
-        if not (override or unit.status in allowed):
-            message = f"Can only assign unit with status: {', '.join(s.value for s in allowed)}. Unit status is {unit.status.value}. Forbidden."
+        if not allowed:
             messenger.warning(
                 f"На стол могут быть помещены изделия со статусами:"
-                f" {', '.join(s.value.upper() for s in allowed)}."
+                f" {', '.join(s.value.upper() for s in allowed_statuses)}."
                 f" Статус изделия: {unit.status.value.upper()}. Отказано."
             )
-            raise AssertionError(message)
+            raise AssertionError(
+                f"Can only assign unit with status: {', '.join(s.value for s in allowed_statuses)}. "
+                "Unit status is {unit.status.value}. Forbidden."
+            )
 
         self.unit = unit
-
-        message = f"Unit {unit.internal_id} has been assigned to the workbench"
-        logger.info(message)
+        logger.info(f"Unit {unit.internal_id} has been assigned to the workbench")
         messenger.success(f"Изделие с внутренним номером {unit.internal_id} помещено на стол")
 
         if not unit.components_filled:
             logger.info(
-                f"Unit {unit.internal_id} is a composition with unsatisfied component requirements. Entering component gathering state."
+                f"Unit {unit.internal_id} is a composition with unsatisfied component requirements. "
+                "Entering component gathering state."
             )
             self.switch_state(State.GATHER_COMPONENTS_STATE)
         else:
@@ -168,18 +130,12 @@ class WorkBench(metaclass=SingletonMeta):
     def remove_unit(self) -> None:
         """remove a unit from the workbench"""
         self._validate_state_transition(State.AUTHORIZED_IDLING_STATE)
-
         if self.unit is None:
-            message = "Cannot remove unit. No unit is currently assigned to the workbench."
             messenger.error("Невозможно убрать со стола изделие. На рабочем столе отсутсвует изделие")
-            raise AssertionError(message)
-
-        message = f"Unit {self.unit.internal_id} has been removed from the workbench"
-        logger.info(message)
+            raise AssertionError("Cannot remove unit. No unit is currently assigned to the workbench.")
+        logger.info(f"Unit {self.unit.internal_id} has been removed from the workbench")
         messenger.success(f"Изделие с внутренним номером {self.unit.internal_id} убрано со стола")
-
         self.unit = None
-
         self.switch_state(State.AUTHORIZED_IDLING_STATE)
 
     @logger.catch(reraise=True, exclude=(StateForbiddenError, AssertionError))
@@ -284,8 +240,7 @@ class WorkBench(metaclass=SingletonMeta):
         passport_file_path: Path = await construct_unit_passport(self.unit)
 
         if CONFIG.ipfs_gateway.enable:
-            res = await publish_file(file_path=passport_file_path, rfid_card_id=self.employee.rfid_card_id)
-            cid, link = res
+            cid, link = await publish_file(file_path=passport_file_path, rfid_card_id=self.employee.rfid_card_id)
             self.unit.passport_ipfs_cid = cid
 
             print_qr = CONFIG.printer.print_qr and (
@@ -295,45 +250,16 @@ class WorkBench(metaclass=SingletonMeta):
             )
 
             if print_qr:
-                short_url: str = await generate_short_url(link)
-                self.unit.passport_short_url = short_url
-                qrcode_path = create_qr(short_url)
-                try:
-                    if self.unit.schema.parent_schema_id is None:
-                        annotation = f"{self.unit.model_name} (ID: {self.unit.internal_id}). {short_url}"
-                    else:
-                        parent_schema = await self._database.get_schema_by_id(self.unit.schema.parent_schema_id)
-                        annotation = f"{parent_schema.unit_name}. {self.unit.model_name} (ID: {self.unit.internal_id}). {short_url}"
-
-                    await print_image(
-                        qrcode_path,
-                        self.employee.rfid_card_id,
-                        annotation=annotation,
-                    )
-                except Exception as e:
-                    messenger.error(f"Ошибка при печати QR-кода: {e}")
-                finally:
-                    os.remove(qrcode_path)
+                self.unit.passport_short_url = await generate_short_url(link)
+                await print_passport_qr_code(self.unit, self.employee.rfid_card_id)
             else:
+                generate_short_url_background(link, self.unit.internal_id)
 
-                async def _bg_generate_short_url(url: str, unit_internal_id: str) -> None:
-                    short_link = await generate_short_url(url)
-                    await MongoDbWrapper().unit_update_single_field(unit_internal_id, "passport_short_url", short_link)
+        if CONFIG.printer.print_security_tag:
+            await print_seal_tag(self.employee.rfid_card_id)
 
-                asyncio.create_task(_bg_generate_short_url(link, self.unit.internal_id))
-
-            if CONFIG.printer.print_security_tag:
-                seal_tag_img: Path = create_seal_tag()
-
-                try:
-                    await print_image(seal_tag_img, self.employee.rfid_card_id)
-                except Exception as e:
-                    messenger.error(f"Ошибка при печати пломбы: {e}")
-                finally:
-                    os.remove(seal_tag_img)
-
-            if CONFIG.robonomics.enable_datalog and res is not None:
-                asyncio.create_task(post_to_datalog(cid, self.unit.internal_id))
+        if CONFIG.robonomics.enable_datalog and self.unit.passport_ipfs_cid:
+            asyncio.create_task(post_to_datalog(self.unit.passport_ipfs_cid, self.unit.internal_id))
 
         await self._database.push_unit(self.unit)
 
